@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
 import threading
 import time
 from datetime import datetime
@@ -26,7 +28,13 @@ from .constants import (
     K_ROOM,
     K_SRC,
 )
-from .dialogs import ConnectionDialog, DiscoveredHubsDialog, PreferencesDialog
+from .dialogs import (
+    ConfigurationDialog,
+    ConnectionDialog,
+    DiscoveredHubsDialog,
+    RestartDialog,
+)
+from .state import StateManager
 from .theme import get_theme_colors
 from .ui_constants import (
     BUTTON_WIDTH,
@@ -147,6 +155,8 @@ class MainFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title="RRC Client", size=(900, 600))
 
+        self.state_manager = StateManager()
+
         theme_colors = get_theme_colors()
         self.COLOR_OWN_MESSAGE = theme_colors["own_message"]
         self.COLOR_NOTICE = theme_colors["notice"]
@@ -184,11 +194,13 @@ class MainFrame(wx.Frame):
 
         self._initialize_reticulum()
 
-        config = _load_config()
-        if "window_x" in config and "window_y" in config:
-            self.SetPosition((config["window_x"], config["window_y"]))
-        if "window_width" in config and "window_height" in config:
-            self.SetSize((config["window_width"], config["window_height"]))
+        window_state = self.state_manager.get_window_state()
+        if window_state.get("position"):
+            self.SetPosition(tuple(window_state["position"]))
+        if window_state.get("size"):
+            self.SetSize(tuple(window_state["size"]))
+        if window_state.get("maximized"):
+            self.Maximize()
 
         self._create_menu_bar()
 
@@ -398,8 +410,8 @@ class MainFrame(wx.Frame):
             wx.ID_ANY, "Discovered &Hubs...", "View and connect to discovered hubs"
         )
         file_menu.AppendSeparator()
-        prefs_item = file_menu.Append(
-            wx.ID_PREFERENCES, "&Preferences...", "Configure colors and fonts"
+        config_item = file_menu.Append(
+            wx.ID_PREFERENCES, "&Configuration...", "Configure application settings"
         )
         file_menu.AppendSeparator()
         quit_item = file_menu.Append(wx.ID_EXIT, "&Quit\tCtrl-Q", "Quit application")
@@ -407,7 +419,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_connect_menu, self.connect_menu_item)
         self.Bind(wx.EVT_MENU, self.on_disconnect_menu, self.disconnect_menu_item)
         self.Bind(wx.EVT_MENU, self.on_discovered_hubs, discovered_hubs_item)
-        self.Bind(wx.EVT_MENU, self.on_preferences, prefs_item)
+        self.Bind(wx.EVT_MENU, self.on_configuration, config_item)
         self.Bind(wx.EVT_MENU, self.on_quit, quit_item)
 
         self.disconnect_menu_item.Enable(False)
@@ -925,9 +937,9 @@ class MainFrame(wx.Frame):
             self.connect_menu_item.Enable(True)
             self.disconnect_menu_item.Enable(False)
 
-    def on_preferences(self, event):
-        """Show preferences dialog."""
-        dlg = PreferencesDialog(self)
+    def on_configuration(self, event):
+        """Show configuration dialog."""
+        dlg = ConfigurationDialog(self)
         if dlg.ShowModal() == wx.ID_OK:
             theme_colors = _get_theme_colors()
             self.COLOR_OWN_MESSAGE = theme_colors["own_message"]
@@ -937,7 +949,39 @@ class MainFrame(wx.Frame):
 
             if self.active_room:
                 self._reload_room_messages()
+
+            if dlg.requires_restart():
+                restart_dlg = RestartDialog(self)
+                result = restart_dlg.ShowModal()
+                restart_dlg.Destroy()
+                
+                if result == wx.ID_YES:
+                    self._restart_application()
         dlg.Destroy()
+
+    def _restart_application(self):
+        """Restart the application."""
+        if hasattr(self, "pending_check_timer"):
+            if self.pending_check_timer and self.pending_check_timer.IsRunning():
+                self.pending_check_timer.Stop()
+        if hasattr(self, "status_update_timer"):
+            if self.status_update_timer and self.status_update_timer.IsRunning():
+                self.status_update_timer.Stop()
+
+        pos = self.GetPosition()
+        size = self.GetSize()
+        is_maximized = self.IsMaximized()
+        self.state_manager.save_window_state(
+            size=(size.width, size.height),
+            position=(pos.x, pos.y),
+            maximized=is_maximized,
+        )
+
+        if self.active_room and self.input_history:
+            self.state_manager.save_input_history(self.active_room, self.input_history)
+
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
 
     def on_quit(self, event):
         """Quit the application."""
@@ -952,14 +996,17 @@ class MainFrame(wx.Frame):
             if self.status_update_timer and self.status_update_timer.IsRunning():
                 self.status_update_timer.Stop()
 
-        config = _load_config()
         pos = self.GetPosition()
         size = self.GetSize()
-        config["window_x"] = pos.x
-        config["window_y"] = pos.y
-        config["window_width"] = size.width
-        config["window_height"] = size.height
-        _save_config(config)
+        is_maximized = self.IsMaximized()
+        self.state_manager.save_window_state(
+            size=(size.width, size.height),
+            position=(pos.x, pos.y),
+            maximized=is_maximized,
+        )
+
+        if self.active_room and self.input_history:
+            self.state_manager.save_input_history(self.active_room, self.input_history)
 
         if self.client:
             self.client.close()
@@ -974,8 +1021,23 @@ class MainFrame(wx.Frame):
 
     def _set_active_room(self, room: str):
         """Set the active room for sending messages and update display."""
+        if self.active_room and self.input_history:
+            config = _load_config()
+            if config.get("save_input_history", True):
+                self.state_manager.save_input_history(
+                    self.active_room, self.input_history
+                )
+
         self.active_room = room
         self.active_room_label.SetLabel(f"Active room: {room}")
+
+        config = _load_config()
+        if config.get("save_input_history", True):
+            self.input_history = self.state_manager.get_input_history(room)
+        else:
+            self.input_history = []
+        self.input_history_index = -1
+        self.input_buffer = ""
 
         if room in self.unread_counts:
             self.unread_counts[room] = 0
@@ -1227,7 +1289,9 @@ class MainFrame(wx.Frame):
 
         if text not in self.input_history or self.input_history[-1] != text:
             self.input_history.append(text)
-            if len(self.input_history) > INPUT_HISTORY_SIZE:
+            config = _load_config()
+            max_history = config.get("input_history_size", INPUT_HISTORY_SIZE)
+            if len(self.input_history) > max_history:
                 self.input_history.pop(0)
 
         self.input_history_index = -1

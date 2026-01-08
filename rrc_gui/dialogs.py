@@ -5,8 +5,9 @@ from __future__ import annotations
 import time
 
 import wx
+import wx.lib.scrolledpanel as scrolled
 
-from .config import load_config
+from .config import get_config_schema, load_config, save_config
 from .ui_constants import (
     INPUT_HISTORY_SIZE,
     RATE_LIMIT_MESSAGES_PER_MINUTE,
@@ -153,6 +154,209 @@ class PreferencesDialog(wx.Dialog):
         return True
 
 
+class ConfigurationDialog(wx.Dialog):
+    """Configuration dialog with tabbed interface for all settings."""
+
+    def __init__(self, parent):
+        super().__init__(parent, title="Configuration", size=(700, 600))
+
+        self.config = load_config()
+        self.original_config = self.config.copy()
+        self.schema = get_config_schema()
+        self.widgets = {}
+        self.needs_restart = False
+
+        panel = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+
+        notebook = wx.Notebook(panel)
+
+        categories: dict[str, list[str]] = {}
+        for key, meta in self.schema.items():
+            category = meta.get("category", "Other")
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(key)
+
+        for category in sorted(categories.keys()):
+            page = self._create_category_page(notebook, category, categories[category])
+            notebook.AddPage(page, category)
+
+        vbox.Add(notebook, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+
+        button_box = wx.BoxSizer(wx.HORIZONTAL)
+        save_btn = wx.Button(panel, wx.ID_OK, "Save")
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        reset_btn = wx.Button(panel, label="Reset to Defaults")
+
+        button_box.Add(save_btn)
+        button_box.Add(cancel_btn, flag=wx.LEFT, border=5)
+        button_box.AddStretchSpacer()
+        button_box.Add(reset_btn)
+
+        vbox.Add(button_box, flag=wx.ALIGN_CENTER | wx.ALL, border=10)
+
+        panel.SetSizer(vbox)
+
+        save_btn.Bind(wx.EVT_BUTTON, self.on_save)
+        reset_btn.Bind(wx.EVT_BUTTON, self.on_reset)
+
+    def _create_category_page(self, parent, category: str, keys: list[str]):
+        """Create a scrolled panel for a category of settings."""
+        panel = scrolled.ScrolledPanel(parent)
+        panel.SetupScrolling()
+
+        vbox = wx.BoxSizer(wx.VERTICAL)
+
+        for key in sorted(keys):
+            meta = self.schema[key]
+            widget = self._create_widget(panel, key, meta)
+            if widget:
+                self.widgets[key] = widget
+
+                hbox = wx.BoxSizer(wx.HORIZONTAL)
+                label = wx.StaticText(panel, label=meta.get("label", key) + ":")
+                label.SetMinSize((200, -1))
+                hbox.Add(label, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=10)
+                hbox.Add(widget, proportion=1, flag=wx.EXPAND)
+
+                vbox.Add(hbox, flag=wx.EXPAND | wx.ALL, border=5)
+
+                if "description" in meta:
+                    desc = wx.StaticText(
+                        panel,
+                        label=meta["description"],
+                        style=wx.ST_NO_AUTORESIZE,
+                    )
+                    desc.SetForegroundColour(
+                        wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT)
+                    )
+                    font = desc.GetFont()
+                    font.SetPointSize(font.GetPointSize() - 1)
+                    desc.SetFont(font)
+                    desc.Wrap(500)
+                    vbox.Add(desc, flag=wx.LEFT | wx.BOTTOM, border=5)
+
+        panel.SetSizer(vbox)
+        return panel
+
+    def _create_widget(self, parent, key: str, meta: dict):
+        """Create appropriate widget for a config value."""
+        widget_type = meta.get("type", "string")
+        value = self.config.get(key)
+
+        if widget_type == "boolean":
+            widget = wx.CheckBox(parent)
+            widget.SetValue(bool(value))
+            return widget
+
+        elif widget_type == "integer":
+            widget = wx.SpinCtrl(
+                parent,
+                min=meta.get("min", 0),
+                max=meta.get("max", 10000),
+                initial=int(value) if value is not None else 0,
+            )
+            return widget
+
+        elif widget_type == "float":
+            widget = wx.SpinCtrlDouble(
+                parent,
+                min=meta.get("min", 0.0),
+                max=meta.get("max", 100.0),
+                initial=float(value) if value is not None else 0.0,
+                inc=0.1,
+            )
+            return widget
+
+        elif widget_type == "choice":
+            choices = meta.get("choices", [])
+            widget = wx.Choice(parent, choices=choices)
+            if value in choices:
+                widget.SetSelection(choices.index(value))
+            elif choices:
+                widget.SetSelection(0)
+            return widget
+
+        elif widget_type in ("string", "path"):
+            widget = wx.TextCtrl(parent, value=str(value) if value is not None else "")
+            return widget
+
+        else:
+            widget = wx.TextCtrl(parent, value=str(value) if value is not None else "")
+            return widget
+
+    def on_save(self, event):
+        """Save configuration."""
+        for key, widget in self.widgets.items():
+            meta = self.schema[key]
+            widget_type = meta.get("type", "string")
+
+            if widget_type == "boolean":
+                self.config[key] = widget.GetValue()
+            elif widget_type == "integer":
+                self.config[key] = widget.GetValue()
+            elif widget_type == "float":
+                self.config[key] = widget.GetValue()
+            elif widget_type == "choice":
+                choices = meta.get("choices", [])
+                selection = widget.GetSelection()
+                if selection >= 0 and selection < len(choices):
+                    self.config[key] = choices[selection]
+            else:
+                self.config[key] = widget.GetValue()
+
+        self.needs_restart = False
+        for key, value in self.config.items():
+            meta = self.schema.get(key, {})
+            if meta.get("requires_restart", False):
+                if self.original_config.get(key) != value:
+                    self.needs_restart = True
+                    break
+
+        save_config(self.config)
+        self.EndModal(wx.ID_OK)
+
+    def on_reset(self, event):
+        """Reset all settings to defaults."""
+        result = wx.MessageBox(
+            "Are you sure you want to reset all settings to their default values?",
+            "Reset Configuration",
+            wx.YES_NO | wx.ICON_QUESTION,
+        )
+
+        if result == wx.YES:
+            from .config import get_default_config
+
+            self.config = get_default_config()
+
+            for key, widget in self.widgets.items():
+                meta = self.schema[key]
+                widget_type = meta.get("type", "string")
+                value = self.config.get(key)
+
+                if widget_type == "boolean":
+                    widget.SetValue(bool(value))
+                elif widget_type == "integer":
+                    widget.SetValue(int(value) if value is not None else 0)
+                elif widget_type == "float":
+                    widget.SetValue(float(value) if value is not None else 0.0)
+                elif widget_type == "choice":
+                    choices = meta.get("choices", [])
+                    if value in choices:
+                        widget.SetSelection(choices.index(value))
+                else:
+                    widget.SetValue(str(value) if value is not None else "")
+
+    def get_config(self):
+        """Get the configuration."""
+        return self.config
+
+    def requires_restart(self):
+        """Check if changes require a restart."""
+        return self.needs_restart
+
+
 class DiscoveredHubsDialog(wx.Dialog):
     """Dialog for displaying and selecting discovered hubs."""
 
@@ -242,3 +446,61 @@ class DiscoveredHubsDialog(wx.Dialog):
     def get_selected_hub_hash(self):
         """Return the selected hub hash."""
         return self.selected_hub_hash
+
+
+class RestartDialog(wx.Dialog):
+    """Dialog prompting user to restart the application."""
+
+    def __init__(self, parent):
+        super().__init__(
+            parent, title="Restart Required", size=(450, 200), style=wx.DEFAULT_DIALOG_STYLE
+        )
+
+        panel = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+
+        hbox_msg = wx.BoxSizer(wx.HORIZONTAL)
+        
+        icon = wx.ArtProvider.GetBitmap(wx.ART_INFORMATION, wx.ART_MESSAGE_BOX, (48, 48))
+        icon_bitmap = wx.StaticBitmap(panel, bitmap=icon)
+        hbox_msg.Add(icon_bitmap, flag=wx.ALL, border=10)
+
+        msg_vbox = wx.BoxSizer(wx.VERTICAL)
+        title_text = wx.StaticText(panel, label="Configuration Saved")
+        font = title_text.GetFont()
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        title_text.SetFont(font)
+        msg_vbox.Add(title_text, flag=wx.BOTTOM, border=5)
+
+        info_text = wx.StaticText(
+            panel,
+            label="Some settings require restarting the application to take effect.\n\n"
+            "Would you like to restart now?",
+        )
+        msg_vbox.Add(info_text)
+
+        hbox_msg.Add(msg_vbox, flag=wx.ALL, border=10)
+        vbox.Add(hbox_msg, flag=wx.EXPAND)
+
+        button_box = wx.BoxSizer(wx.HORIZONTAL)
+        restart_btn = wx.Button(panel, wx.ID_YES, "Restart Now")
+        later_btn = wx.Button(panel, wx.ID_NO, "Restart Later")
+        
+        restart_btn.SetDefault()
+        button_box.Add(restart_btn)
+        button_box.Add(later_btn, flag=wx.LEFT, border=5)
+        vbox.Add(button_box, flag=wx.ALIGN_CENTER | wx.ALL, border=10)
+
+        panel.SetSizer(vbox)
+        self.Centre()
+
+        restart_btn.Bind(wx.EVT_BUTTON, self.on_restart)
+        later_btn.Bind(wx.EVT_BUTTON, self.on_later)
+
+    def on_restart(self, event):
+        """Handle Restart Now button."""
+        self.EndModal(wx.ID_YES)
+
+    def on_later(self, event):
+        """Handle Restart Later button."""
+        self.EndModal(wx.ID_NO)
