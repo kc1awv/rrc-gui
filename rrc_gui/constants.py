@@ -31,15 +31,20 @@ T_ERROR = 40
 
 T_RESOURCE_ENVELOPE = 50
 
-# HELLO body keys (spec 0.1.1: keys start at 0, nickname moved to envelope)
-B_HELLO_NAME = 0
-B_HELLO_VER = 1
-B_HELLO_CAPS = 2
+# HELLO body keys
+B_HELLO_NICK = 0
+B_HELLO_NAME = 1
+B_HELLO_VER = 2
+B_HELLO_CAPS = 3
 
-# WELCOME body keys (spec 0.1.1: greeting replaced with hub version)
+# WELCOME body keys
 B_WELCOME_HUB = 0
-B_WELCOME_VER = 1
-B_WELCOME_CAPS = 2
+B_WELCOME_GREETING = 1
+B_WELCOME_VER = 2  # Hub software version (str)
+B_WELCOME_CAPS = 3
+
+# JOINED body keys
+B_JOINED_USERS = 0  # List of user identity hashes (list[bytes]) in the room
 
 # Capabilities map keys
 CAP_RESOURCE_ENVELOPE = 0

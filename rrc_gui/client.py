@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable
@@ -11,10 +11,9 @@ from typing import Any
 
 import RNS
 
-logger = logging.getLogger(__name__)
-
 from .codec import decode, encode
 from .constants import (
+    B_HELLO_CAPS,
     B_HELLO_NAME,
     B_HELLO_VER,
     B_RES_ENCODING,
@@ -22,8 +21,10 @@ from .constants import (
     B_RES_KIND,
     B_RES_SHA256,
     B_RES_SIZE,
+    CAP_RESOURCE_ENVELOPE,
     K_BODY,
     K_ID,
+    K_NICK,
     K_ROOM,
     K_T,
     RES_KIND_MOTD,
@@ -42,6 +43,8 @@ from .constants import (
     T_WELCOME,
 )
 from .envelope import make_envelope, validate_envelope
+
+logger = logging.getLogger(__name__)
 
 
 class MessageTooLargeError(RuntimeError):
@@ -67,11 +70,13 @@ class _ResourceExpectation:
 @dataclass(frozen=True)
 class ClientConfig:
     dest_name: str = "rrc.hub"
-    max_resource_bytes: int = 262144
+    max_resource_bytes: int = 262144  # 256 KiB
     resource_expectation_ttl_s: float = 30.0
     max_pending_resource_expectations: int = 8
+    max_active_resources: int = 16
     hello_interval_s: float = 3.0
     hello_max_attempts: int = 3
+    cleanup_existing_links: bool = True
 
 
 def parse_hash(text: str) -> bytes:
@@ -81,7 +86,7 @@ def parse_hash(text: str) -> bytes:
     s = "".join(ch for ch in s if not ch.isspace())
     try:
         b = bytes.fromhex(s)
-    except ValueError as e:
+    except Exception as e:
         raise ValueError(f"invalid hash {text!r}: {e}") from e
     if len(b) != 16:
         raise ValueError(f"destination hash must be 16 bytes (got {len(b)})")
@@ -101,8 +106,9 @@ class Client:
         self.config = config or ClientConfig()
 
         self.hello_body: dict[int, Any] = dict(hello_body or {})
-        self.hello_body.setdefault(B_HELLO_NAME, "rrc-client")
+        self.hello_body.setdefault(B_HELLO_NAME, "rrc-gui")
         self.hello_body.setdefault(B_HELLO_VER, "0.1.0")
+        self.hello_body.setdefault(B_HELLO_CAPS, {CAP_RESOURCE_ENVELOPE: True})
 
         self.nickname = nickname
 
@@ -112,6 +118,7 @@ class Client:
         self._lock = threading.RLock()
         self._welcomed = threading.Event()
 
+        # Resource transfer state
         self._resource_expectations: dict[bytes, _ResourceExpectation] = {}
         self._active_resources: set[RNS.Resource] = set()
         self._resource_to_expectation: dict[RNS.Resource, _ResourceExpectation] = {}
@@ -137,27 +144,37 @@ class Client:
 
         RNS.Transport.request_path(hub_dest_hash)
 
+        # `request_path()` is async. On a cold start, allowing a brief window for
+        # a path to materialize can avoid racing `Identity.recall()`.
         try:
             path_wait_deadline = time.monotonic() + min(5.0, float(timeout_s))
+            sleep_interval = 0.05
+            max_sleep = 0.5
             while time.monotonic() < path_wait_deadline:
                 if RNS.Transport.has_path(hub_dest_hash):
                     break
-                time.sleep(0.1)
+                time.sleep(sleep_interval)
+                sleep_interval = min(sleep_interval * 1.5, max_sleep)
         except Exception as e:
             logger.warning("Error during path wait: %s", e)
 
         recall_deadline = time.monotonic() + float(timeout_s)
         hub_identity: RNS.Identity | None = None
+        sleep_interval = 0.05
+        max_sleep = 0.5
         while time.monotonic() < recall_deadline:
             hub_identity = RNS.Identity.recall(hub_dest_hash)
             if hub_identity is not None:
                 break
-            time.sleep(0.1)
+            time.sleep(sleep_interval)
+            sleep_interval = min(sleep_interval * 1.5, max_sleep)
 
         if hub_identity is None:
             raise TimeoutError(
                 "Could not recall hub identity from destination hash. "
-                "Make sure the hub is announcing and reachable."
+                "Ensure: 1) The hub is online and announcing on the network, "
+                "2) You have network connectivity to the Reticulum network, "
+                "3) The hub hash is correct."
             )
 
         app_name, aspects = RNS.Destination.app_and_aspects_from_name(
@@ -174,8 +191,10 @@ class Client:
 
         if hub_dest.hash != hub_dest_hash:
             raise ValueError(
-                "Hub hash does not match dest-name. "
-                "Check --dest-name (must match hub) and --hub."
+                "Hub hash does not match the destination name aspect. "
+                f"Expected hash for '{self.config.dest_name}': {hub_dest.hash.hex()}, "
+                f"but got: {hub_dest_hash.hex()}. "
+                "Verify the hub hash and ensure dest_name matches the hub's announcement."
             )
 
         def _send_hello(link: RNS.Link) -> None:
@@ -183,13 +202,13 @@ class Client:
                 T_HELLO, src=self.identity.hash, body=self.hello_body
             )
             if self.nickname:
-                from .constants import K_NICK
-
                 envelope[K_NICK] = self.nickname
             payload = encode(envelope)
             RNS.Packet(link, payload).send()
 
         def _hello_loop(link: RNS.Link, deadline: float) -> None:
+            # Spec guidance: HELLO is expected once per session; retries should be
+            # conservative to avoid hubs disconnecting "chatty" clients.
             hello_interval_s = self.config.hello_interval_s
             max_attempts = self.config.hello_max_attempts
 
@@ -218,10 +237,33 @@ class Client:
                 time.sleep(0.1)
 
         def _established(established_link: RNS.Link) -> None:
+            logger.debug("Link established - setting resource callbacks")
+            established_link.set_resource_strategy(RNS.Link.ACCEPT_APP)
+            established_link.set_resource_callback(self._resource_advertised)
+            established_link.set_resource_started_callback(self._resource_advertised)
+            established_link.set_resource_concluded_callback(self._resource_concluded)
+
+            # Also try setting via private attributes (RNS internal implementation)
+            try:
+                established_link._Link__resource_callback = self._resource_advertised
+                established_link._Link__resource_started_callback = (
+                    self._resource_advertised
+                )
+                established_link._Link__resource_concluded_callback = (
+                    self._resource_concluded
+                )
+                logger.debug("Set callbacks via private attributes as fallback")
+            except Exception as e:
+                logger.debug(f"Could not set private attributes: {e}")
+
             try:
                 established_link.identify(self.identity)
             except Exception as e:
-                logger.warning("Failed to identify on established link: %s", e)
+                logger.error("Failed to identify on established link: %s", e)
+                with contextlib.suppress(Exception):
+                    established_link.teardown()
+                return
+
             deadline = time.monotonic() + float(timeout_s)
             t = threading.Thread(
                 target=_hello_loop,
@@ -240,12 +282,23 @@ class Client:
                 self._active_resources.clear()
                 self._resource_to_expectation.clear()
 
-            for resource in active_resources:
-                try:
-                    if hasattr(resource, "cancel") and callable(resource.cancel):
-                        resource.cancel()
-                except Exception as e:
-                    logger.debug("Error canceling resource in _closed callback: %s", e)
+                for resource in active_resources:
+                    try:
+                        if hasattr(resource, "cancel") and callable(resource.cancel):
+                            resource.cancel()
+                    except Exception as e:
+                        logger.debug(
+                            "Error canceling resource in link closed callback: %s", e
+                        )
+                    finally:
+                        try:
+                            if hasattr(resource, "data") and resource.data:
+                                resource.data.close()
+                        except Exception as e:
+                            logger.debug(
+                                "Error closing resource data in link closed callback: %s",
+                                e,
+                            )
 
             if self.on_close:
                 try:
@@ -253,67 +306,75 @@ class Client:
                 except Exception as e:
                     logger.exception("Error in on_close callback: %s", e)
 
-        found_existing = False
+        if self.config.cleanup_existing_links:
+            found_existing = False
 
-        if hasattr(RNS.Transport, "active_links") and RNS.Transport.active_links:
-            for existing_link in list(RNS.Transport.active_links):
-                try:
-                    dest_hash = (
-                        existing_link.destination.hash
-                        if existing_link.destination
-                        else None
-                    )
-                    if dest_hash == hub_dest_hash:
-                        existing_link.teardown()
-                        found_existing = True
-                except Exception as e:
-                    logger.debug("Error checking/tearing down existing link: %s", e)
-
-        if hasattr(RNS.Transport, "pending_links") and RNS.Transport.pending_links:
-            for existing_link in list(RNS.Transport.pending_links):
-                try:
-                    dest_hash = (
-                        existing_link.destination.hash
-                        if existing_link.destination
-                        else None
-                    )
-                    if dest_hash == hub_dest_hash:
-                        existing_link.teardown()
-                        found_existing = True
-                except Exception as e:
-                    logger.debug("Error checking/tearing down pending link: %s", e)
-
-        if hasattr(RNS.Transport, "link_table") and RNS.Transport.link_table:
-            for _link_id, link_entry in list(RNS.Transport.link_table.items()):
-                try:
-                    existing_link = (
-                        link_entry[0]
-                        if isinstance(link_entry, (tuple, list))
-                        else link_entry
-                    )
-                    if (
-                        hasattr(existing_link, "destination")
-                        and existing_link.destination
-                    ):
-                        if existing_link.destination.hash == hub_dest_hash:
+            if hasattr(RNS.Transport, "active_links") and RNS.Transport.active_links:
+                for existing_link in list(RNS.Transport.active_links):
+                    try:
+                        dest_hash = (
+                            existing_link.destination.hash
+                            if existing_link.destination
+                            else None
+                        )
+                        if dest_hash == hub_dest_hash:
+                            logger.info("Tearing down existing active link to same hub")
                             existing_link.teardown()
                             found_existing = True
-                except Exception as e:
-                    logger.debug(
-                        "Error checking/tearing down link from link_table: %s", e
-                    )
+                    except Exception as e:
+                        logger.warning(
+                            "Error checking/tearing down existing link: %s", e
+                        )
 
-        if found_existing:
-            time.sleep(1.0)
+            if hasattr(RNS.Transport, "pending_links") and RNS.Transport.pending_links:
+                for existing_link in list(RNS.Transport.pending_links):
+                    try:
+                        dest_hash = (
+                            existing_link.destination.hash
+                            if existing_link.destination
+                            else None
+                        )
+                        if dest_hash == hub_dest_hash:
+                            logger.info(
+                                "Tearing down existing pending link to same hub"
+                            )
+                            existing_link.teardown()
+                            found_existing = True
+                    except Exception as e:
+                        logger.warning(
+                            "Error checking/tearing down pending link: %s", e
+                        )
+
+            if hasattr(RNS.Transport, "link_table") and RNS.Transport.link_table:
+                for _link_id, link_entry in list(RNS.Transport.link_table.items()):
+                    try:
+                        existing_link = (
+                            link_entry[0]
+                            if isinstance(link_entry, (tuple, list))
+                            else link_entry
+                        )
+                        if (
+                            hasattr(existing_link, "destination")
+                            and existing_link.destination
+                            and existing_link.destination.hash == hub_dest_hash
+                        ):
+                            logger.info(
+                                "Tearing down existing link from link_table to same hub"
+                            )
+                            existing_link.teardown()
+                            found_existing = True
+                    except Exception as e:
+                        logger.warning(
+                            "Error checking/tearing down link from link_table: %s", e
+                        )
+
+            if found_existing:
+                time.sleep(1.0)
 
         link = RNS.Link(
             hub_dest, established_callback=_established, closed_callback=_closed
         )
         link.set_packet_callback(lambda data, pkt: self._on_packet(data))
-
-        link.set_resource_strategy(RNS.Link.ACCEPT_APP)
-        link.set_resource_started_callback(self._resource_advertised)
-        link.set_resource_concluded_callback(self._resource_concluded)
 
         with self._lock:
             self.link = link
@@ -322,8 +383,12 @@ class Client:
             logger.debug("Waiting for WELCOME (timeout=%ss)...", timeout_s)
             welcome_timeout = float(timeout_s)
             if not self._welcomed.wait(timeout=welcome_timeout):
-                logger.error("Timed out waiting for WELCOME")
-                raise TimeoutError("Timed out waiting for WELCOME")
+                logger.error("Timed out waiting for WELCOME from hub")
+                raise TimeoutError(
+                    f"Timed out waiting for WELCOME response from hub after {timeout_s}s. "
+                    "The hub may be overloaded, unreachable, or not accepting connections. "
+                    "Try again later or verify the hub is operational."
+                )
             logger.debug("WELCOME received")
 
     def close(self) -> None:
@@ -358,30 +423,73 @@ class Client:
                 logger.debug("Error tearing down link during close: %s", e)
 
     def join(self, room: str, *, key: str | None = None) -> None:
+        if not isinstance(room, str):
+            raise ValueError(f"Room name must be a string (got {type(room).__name__})")
         r = room.strip().lower()
+        if not r:
+            raise ValueError(
+                "Room name cannot be empty. Provide a valid room name like 'general' or 'chat'."
+            )
         body: Any = key if (isinstance(key, str) and key) else None
         self._send(make_envelope(T_JOIN, src=self.identity.hash, room=r, body=body))
 
     def part(self, room: str) -> None:
+        if not isinstance(room, str):
+            raise ValueError(f"Room name must be a string (got {type(room).__name__})")
         r = room.strip().lower()
+        if not r:
+            raise ValueError(
+                "Room name cannot be empty. Provide the name of the room to leave."
+            )
         self._send(make_envelope(T_PART, src=self.identity.hash, room=r))
         with self._lock:
             self.rooms.discard(r)
 
     def msg(self, room: str, text: str) -> bytes:
+        if not isinstance(room, str):
+            raise ValueError(f"Room name must be a string (got {type(room).__name__})")
+        if not isinstance(text, str):
+            raise ValueError(
+                f"Message text must be a string (got {type(text).__name__})"
+            )
         r = room.strip().lower()
+        if not r:
+            raise ValueError(
+                "Room name cannot be empty. Specify the room to send the message to."
+            )
+        if not text.strip():
+            raise ValueError("Message text cannot be empty. Enter a message to send.")
         env = make_envelope(T_MSG, src=self.identity.hash, room=r, body=text)
+        if self.nickname:
+            env[K_NICK] = self.nickname
         self._send(env)
         mid = env.get(K_ID)
-        if isinstance(mid, bytearray):
-            return bytes(mid)
-        if isinstance(mid, bytes):
-            return mid
-        raise TypeError("message id (K_ID) must be bytes")
+        if not isinstance(mid, (bytes, bytearray)):
+            raise TypeError("message id (K_ID) must be bytes")
+        return bytes(mid)
 
     def notice(self, room: str, text: str) -> None:
+        if not isinstance(room, str):
+            raise ValueError(f"Room name must be a string (got {type(room).__name__})")
+        if not isinstance(text, str):
+            raise ValueError(
+                f"Notice text must be a string (got {type(text).__name__})"
+            )
         r = room.strip().lower()
-        self._send(make_envelope(T_NOTICE, src=self.identity.hash, room=r, body=text))
+        if not r:
+            raise ValueError(
+                "Room name cannot be empty. Specify the room for the notice."
+            )
+        if not text.strip():
+            raise ValueError("Notice text cannot be empty. Enter notice text to send.")
+        env = make_envelope(T_NOTICE, src=self.identity.hash, room=r, body=text)
+        if self.nickname:
+            env[K_NICK] = self.nickname
+        self._send(env)
+
+    def ping(self) -> None:
+        """Send a PING to the server."""
+        self._send(make_envelope(T_PING, src=self.identity.hash))
 
     def _packet_would_fit(self, link: RNS.Link, payload: bytes) -> bool:
         """Check if packet would fit within link MDU."""
@@ -389,8 +497,7 @@ class Client:
             pkt = RNS.Packet(link, payload)
             pkt.pack()
             return True
-        except Exception as e:
-            logger.debug("Packet would not fit in MDU: %s", e)
+        except Exception:
             return False
 
     def _cleanup_expired_expectations(self) -> None:
@@ -410,9 +517,11 @@ class Client:
         self._cleanup_expired_expectations()
 
         with self._lock:
-            for rid, exp in list(self._resource_expectations.items()):
+            for _rid, exp in list(self._resource_expectations.items()):
                 if exp.size == size:
-                    return self._resource_expectations.pop(rid, None)
+                    # Don't pop yet - just return the expectation
+                    # We'll remove it when the resource transfer completes
+                    return exp
         return None
 
     def _resource_advertised(self, resource: RNS.Resource) -> bool:
@@ -420,35 +529,118 @@ class Client:
         Callback when a Resource is advertised by the hub.
         Returns True to accept, False to reject.
         """
-        size = resource.total_size if hasattr(resource, "total_size") else resource.size
+        try:
+            # Handle both Resource and ResourceAdvertisement objects
+            if hasattr(resource, "get_data_size"):
+                size = resource.get_data_size()
+                logger.debug(
+                    f"ResourceAdvertisement: data_size={size}, transfer_size={resource.get_transfer_size()}"
+                )
+            elif hasattr(resource, "total_size"):
+                size = resource.total_size
+            elif hasattr(resource, "size"):
+                size = resource.size
+            else:
+                logger.error(
+                    f"Resource object has no size attribute: type={type(resource)}"
+                )
+                return False
+
+            logger.debug(
+                f"Resource advertised: size={size}, type={type(resource).__name__}"
+            )
+        except Exception as e:
+            logger.error(f"Error getting resource size: {e}", exc_info=True)
+            return False
 
         if size > self.config.max_resource_bytes:
+            logger.debug(
+                f"Rejecting resource: size {size} exceeds max {self.config.max_resource_bytes}"
+            )
             return False
+
+        with self._lock:
+            if len(self._active_resources) >= self.config.max_active_resources:
+                logger.warning(
+                    f"Rejecting resource: already have {len(self._active_resources)} active transfers"
+                )
+                return False
 
         exp = self._find_resource_expectation(size)
         if not exp:
-            return False
+            logger.warning(
+                f"Resource advertised without matching expectation (size={size}). "
+                f"Will accept speculatively. Current expectations: {list(self._resource_expectations.keys())}"
+            )
+            # Accept anyway - the expectation might arrive after the resource advertisement
+            # We'll validate when the resource completes
+            with self._lock:
+                if len(self._active_resources) >= self.config.max_active_resources:
+                    logger.warning(
+                        f"Rejecting speculative resource: already have {len(self._active_resources)} active transfers"
+                    )
+                    return False
+                self._active_resources.add(resource)
+            logger.info(
+                f"Accepted speculative resource transfer: size={size}, active={len(self._active_resources)}"
+            )
+            return True
 
         with self._lock:
             self._active_resources.add(resource)
             self._resource_to_expectation[resource] = exp
+
+        logger.info(
+            f"Accepted resource transfer: kind={exp.kind}, size={size}, active={len(self._active_resources)}"
+        )
         return True
 
     def _resource_concluded(self, resource: RNS.Resource) -> None:
         """Callback when a Resource transfer completes."""
+        logger.debug(f"Resource concluded callback triggered, status={resource.status}")
         with self._lock:
             self._active_resources.discard(resource)
             matched_exp = self._resource_to_expectation.pop(resource, None)
 
         if not matched_exp:
-            try:
-                if hasattr(resource, "data") and resource.data:
-                    resource.data.close()
-            except Exception as e:
-                logger.debug("Error closing unexpected resource data: %s", e)
-            return
+            logger.warning(
+                f"Resource concluded without matching expectation (status={resource.status}). "
+                f"Attempting to find expectation by size..."
+            )
+            # Try to find an expectation now - it might have arrived after the resource was advertised
+            size = (
+                resource.total_size
+                if hasattr(resource, "total_size")
+                else resource.size
+            )
+            matched_exp = self._find_resource_expectation(size)
+            if not matched_exp:
+                logger.warning(
+                    f"No expectation found for concluded resource (size={size})"
+                )
+                try:
+                    if hasattr(resource, "data") and resource.data:
+                        resource.data.close()
+                except Exception as e:
+                    logger.debug("Error closing unexpected resource data: %s", e)
+                return
+            logger.info(
+                f"Matched concluded resource with expectation: kind={matched_exp.kind}, size={size}"
+            )
+
+        # Remove the expectation now that we're processing the resource
+        with self._lock:
+            # Find and remove the expectation by value since we might not have the key
+            for rid, exp in list(self._resource_expectations.items()):
+                if exp == matched_exp:
+                    self._resource_expectations.pop(rid, None)
+                    logger.debug(f"Removed expectation {rid.hex()}")
+                    break
 
         if resource.status != RNS.Resource.COMPLETE:
+            logger.warning(
+                f"Resource transfer incomplete: status={resource.status}, kind={matched_exp.kind}"
+            )
             try:
                 if hasattr(resource, "data") and resource.data:
                     resource.data.close()
@@ -466,21 +658,24 @@ class Client:
                 if hasattr(resource, "data") and resource.data:
                     resource.data.close()
             except Exception as e:
-                logger.debug("Error closing resource data in finally block: %s", e)
+                logger.debug("Error closing resource data: %s", e)
 
         if data is None:
             return
 
         if matched_exp.sha256:
-            computed_hash = hashlib.sha256(data).digest()
-            if computed_hash != matched_exp.sha256:
-                logger.warning("Resource SHA256 mismatch for kind=%s", matched_exp.kind)
+            computed = hashlib.sha256(data).digest()
+            if computed != matched_exp.sha256:
+                logger.warning("Resource SHA256 mismatch")
                 return
 
         if matched_exp.kind == RES_KIND_NOTICE:
             try:
                 encoding = matched_exp.encoding or "utf-8"
                 text = data.decode(encoding)
+                logger.info(
+                    f"Received NOTICE resource ({len(text)} chars): {text[:100]}..."
+                )
                 env = {
                     K_T: T_NOTICE,
                     K_BODY: text,
@@ -491,6 +686,8 @@ class Client:
                         self.on_notice(env)
                     except Exception as e:
                         logger.exception("Error in on_notice callback: %s", e)
+                else:
+                    logger.warning("Received NOTICE but on_notice callback is None")
             except UnicodeDecodeError as e:
                 logger.warning("Failed to decode NOTICE resource as text: %s", e)
             except Exception as e:
@@ -499,6 +696,9 @@ class Client:
             try:
                 encoding = matched_exp.encoding or "utf-8"
                 text = data.decode(encoding)
+                logger.info(
+                    f"Received MOTD resource ({len(text)} chars): {text[:100]}..."
+                )
                 env = {
                     K_T: T_NOTICE,
                     K_BODY: text,
@@ -509,6 +709,8 @@ class Client:
                         self.on_notice(env)
                     except Exception as e:
                         logger.exception("Error in on_notice callback for MOTD: %s", e)
+                else:
+                    logger.warning("Received MOTD but on_notice callback is None")
             except UnicodeDecodeError as e:
                 logger.warning("Failed to decode MOTD resource as text: %s", e)
             except Exception as e:
@@ -518,9 +720,12 @@ class Client:
         with self._lock:
             link = self.link
         if link is None:
-            raise RuntimeError("not connected")
+            raise RuntimeError(
+                "Not connected to hub. Call connect() with a valid hub hash before sending messages."
+            )
         payload = encode(env)
 
+        # Check if message would fit in link MDU
         if not self._packet_would_fit(link, payload):
             msg_type = env.get(K_T)
             if self.on_resource_warning:
@@ -532,10 +737,8 @@ class Client:
                     warning = "Notice is too large to send. Please shorten the notice."
                 else:
                     warning = "Message is too large to send over this link."
-                try:
+                with contextlib.suppress(Exception):
                     self.on_resource_warning(warning)
-                except Exception:
-                    pass
             raise MessageTooLargeError("Message exceeds link MDU")
 
         RNS.Packet(link, payload).send()
@@ -553,21 +756,18 @@ class Client:
 
         if t == T_PING:
             body = env.get(K_BODY)
-            try:
+            with contextlib.suppress(Exception):
                 self._send(make_envelope(T_PONG, src=self.identity.hash, body=body))
-            except Exception:
-                pass
             return
 
         if t == T_PONG:
             if self.on_pong:
-                try:
+                with contextlib.suppress(Exception):
                     self.on_pong(env)
-                except Exception:
-                    pass
             return
 
         if t == T_RESOURCE_ENVELOPE:
+            # Handle incoming resource envelope
             body = env.get(K_BODY)
             if not isinstance(body, dict):
                 return
@@ -590,17 +790,21 @@ class Client:
                 if encoding is not None and not isinstance(encoding, str):
                     return
 
+                # Check size limit
                 if size > self.config.max_resource_bytes:
                     return
 
+                # Create expectation
                 now = time.monotonic()
                 room = env.get(K_ROOM)
 
                 with self._lock:
+                    # Check expectation limits
                     if (
                         len(self._resource_expectations)
                         >= self.config.max_pending_resource_expectations
                     ):
+                        # Remove oldest
                         oldest_rid = min(
                             self._resource_expectations.keys(),
                             key=lambda r: self._resource_expectations[r].created_at,
@@ -617,6 +821,12 @@ class Client:
                         expires_at=now + self.config.resource_expectation_ttl_s,
                         room=room if isinstance(room, str) else None,
                     )
+                    logger.debug(
+                        "Stored resource expectation: kind=%s, size=%d, rid=%s",
+                        kind,
+                        size,
+                        rid.hex() if isinstance(rid, bytes) else rid,
+                    )
             except Exception as e:
                 logger.warning("Failed to process resource envelope: %s", e)
             return
@@ -630,7 +840,7 @@ class Client:
                 except Exception as e:
                     logger.exception("Error in on_welcome callback: %s", e)
             else:
-                logger.warning("Received WELCOME but on_welcome callback is None")
+                logger.debug("Received WELCOME but on_welcome callback is None")
             return
 
         if t == T_JOINED:
@@ -644,6 +854,8 @@ class Client:
                         self.on_joined(r, env)
                     except Exception as e:
                         logger.exception("Error in on_joined callback: %s", e)
+                else:
+                    logger.debug("Received JOINED but on_joined callback is None")
             return
 
         if t == T_PARTED:
@@ -657,6 +869,8 @@ class Client:
                         self.on_parted(r, env)
                     except Exception as e:
                         logger.exception("Error in on_parted callback: %s", e)
+                else:
+                    logger.debug("Received PARTED but on_parted callback is None")
             return
 
         if t == T_MSG:
@@ -665,17 +879,19 @@ class Client:
                     self.on_message(env)
                 except Exception as e:
                     logger.exception("Error in on_message callback: %s", e)
+            else:
+                logger.debug("Received MSG but on_message callback is None")
             return
 
         if t == T_NOTICE:
-            logger.debug("Received T_NOTICE, on_notice=%s", self.on_notice)
+            logger.debug("Received T_NOTICE")
             if self.on_notice:
                 try:
                     self.on_notice(env)
                 except Exception as e:
                     logger.exception("Error in on_notice callback: %s", e)
             else:
-                logger.warning("Received NOTICE but on_notice callback is None")
+                logger.debug("Received NOTICE but on_notice callback is None")
             return
 
         if t == T_ERROR:
@@ -684,4 +900,6 @@ class Client:
                     self.on_error(env)
                 except Exception as e:
                     logger.exception("Error in on_error callback: %s", e)
+            else:
+                logger.debug("Received ERROR but on_error callback is None")
             return

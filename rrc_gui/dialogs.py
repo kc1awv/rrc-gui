@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import wx
 
 from .config import load_config
@@ -15,14 +17,12 @@ from .ui_constants import (
 class ConnectionDialog(wx.Dialog):
     """Dialog for collecting connection parameters."""
 
-    def __init__(self, parent) -> None:
+    def __init__(self, parent):
         super().__init__(parent, title="Connect to RRC Hub", size=(450, 260))
 
         saved_config = load_config()
 
-        self._identity_path = saved_config.get(
-            "identity_path", "~/.rrc/client_identity"
-        )
+        self._identity_path = saved_config.get("identity_path", "~/.rrc-gui/identity")
         self._dest_name = saved_config.get("dest_name", "rrc.hub")
         self._configdir = saved_config.get("configdir", "")
 
@@ -61,7 +61,7 @@ class ConnectionDialog(wx.Dialog):
 
         panel.SetSizer(vbox)
 
-    def get_values(self) -> dict[str, str]:
+    def get_values(self):
         """Return the connection parameters as a dict."""
         return {
             "hub_hash": self.hub_text.GetValue().strip(),
@@ -72,7 +72,7 @@ class ConnectionDialog(wx.Dialog):
             "configdir": self._configdir,
         }
 
-    def Validate(self) -> bool:
+    def Validate(self):
         """Validate dialog inputs before accepting."""
         hub_hash = self.hub_text.GetValue().strip()
         if not hub_hash:
@@ -99,27 +99,6 @@ class ConnectionDialog(wx.Dialog):
                 "Validation Error",
                 wx.OK | wx.ICON_WARNING,
             )
-            return False
-
-        nickname = self.nick_text.GetValue().strip()
-        if nickname:
-            if len(nickname) > 32:
-                wx.MessageBox(
-                    f"Nickname is too long ({len(nickname)} characters).\n"
-                    "Maximum length is 32 characters.",
-                    "Validation Error",
-                    wx.OK | wx.ICON_ERROR,
-                )
-                return False
-
-            if not all(32 <= ord(c) <= 126 for c in nickname):
-                wx.MessageBox(
-                    "Nickname contains invalid characters.\n"
-                    "Only printable ASCII characters are allowed.",
-                    "Validation Error",
-                    wx.OK | wx.ICON_ERROR,
-                )
-                return False
 
         return True
 
@@ -127,7 +106,7 @@ class ConnectionDialog(wx.Dialog):
 class PreferencesDialog(wx.Dialog):
     """Preferences dialog for colors and fonts."""
 
-    def __init__(self, parent) -> None:
+    def __init__(self, parent):
         super().__init__(parent, title="Preferences", size=(400, 300))
 
         panel = wx.Panel(self)
@@ -168,3 +147,98 @@ class PreferencesDialog(wx.Dialog):
         vbox.Add(button_box, flag=wx.ALIGN_CENTER | wx.ALL, border=10)
 
         panel.SetSizer(vbox)
+
+    def Validate(self):
+        """Validate dialog inputs."""
+        return True
+
+
+class DiscoveredHubsDialog(wx.Dialog):
+    """Dialog for displaying and selecting discovered hubs."""
+
+    def __init__(self, parent, discovered_hubs: dict):
+        super().__init__(parent, title="Discovered Hubs", size=(600, 400))
+
+        self.discovered_hubs = discovered_hubs
+        self.selected_hub_hash = None
+
+        panel = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+
+        info_text = wx.StaticText(panel, label="Select a hub to connect:")
+        vbox.Add(info_text, flag=wx.ALL, border=10)
+
+        self.hub_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.hub_list.InsertColumn(0, "Hub Name", width=200)
+        self.hub_list.InsertColumn(1, "Hash", width=280)
+        self.hub_list.InsertColumn(2, "Last Seen", width=100)
+
+        self._populate_hub_list()
+
+        vbox.Add(self.hub_list, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+
+        button_box = wx.BoxSizer(wx.HORIZONTAL)
+        connect_btn = wx.Button(panel, wx.ID_OK, "Connect to Selected")
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        button_box.Add(connect_btn)
+        button_box.Add(cancel_btn, flag=wx.LEFT, border=5)
+        vbox.Add(button_box, flag=wx.ALIGN_CENTER | wx.ALL, border=10)
+
+        panel.SetSizer(vbox)
+
+        self.hub_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_hub_activated)
+        connect_btn.Bind(wx.EVT_BUTTON, self.on_connect_clicked)
+
+    def _populate_hub_list(self):
+        """Populate the hub list with discovered hubs."""
+        sorted_hubs = sorted(
+            self.discovered_hubs.items(),
+            key=lambda x: x[1].get("last_seen", 0),
+            reverse=True,
+        )
+
+        for idx, (hash_hex, hub_info) in enumerate(sorted_hubs):
+            name = hub_info.get("name", "Unknown")
+            last_seen = hub_info.get("last_seen", 0)
+
+            if last_seen > 0:
+                elapsed = int(time.time() - last_seen)
+                if elapsed < 60:
+                    time_str = "Just now"
+                elif elapsed < 3600:
+                    time_str = f"{elapsed // 60}m ago"
+                else:
+                    time_str = f"{elapsed // 3600}h ago"
+            else:
+                time_str = "Unknown"
+
+            index = self.hub_list.InsertItem(idx, name)
+            self.hub_list.SetItem(index, 1, hash_hex)
+            self.hub_list.SetItem(index, 2, time_str)
+
+            self.hub_list.SetItemData(index, idx)
+
+        if self.hub_list.GetItemCount() > 0:
+            self.hub_list.Select(0)
+
+    def on_hub_activated(self, event):
+        """Handle double-click on hub item."""
+        self.on_connect_clicked(event)
+
+    def on_connect_clicked(self, event):
+        """Handle connect button click."""
+        selected = self.hub_list.GetFirstSelected()
+        if selected == -1:
+            wx.MessageBox(
+                "Please select a hub to connect.",
+                "No Selection",
+                wx.OK | wx.ICON_WARNING,
+            )
+            return
+
+        self.selected_hub_hash = self.hub_list.GetItemText(selected, 1)
+        self.EndModal(wx.ID_OK)
+
+    def get_selected_hub_hash(self):
+        """Return the selected hub hash."""
+        return self.selected_hub_hash
