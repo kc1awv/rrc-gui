@@ -954,7 +954,7 @@ class MainFrame(wx.Frame):
                 restart_dlg = RestartDialog(self)
                 result = restart_dlg.ShowModal()
                 restart_dlg.Destroy()
-                
+
                 if result == wx.ID_YES:
                     self._restart_application()
         dlg.Destroy()
@@ -1728,9 +1728,9 @@ class MainFrame(wx.Frame):
     def _on_joined(self, room: str, env: dict):
         """Handle JOINED confirmation.
 
-        This handles two scenarios:
-        1. Self-join: Multiple hashes or empty list (we just joined)
-        2. Member-join: Single hash (another user joined a room we're in)
+        Per rrcd spec:
+        - When YOU join: body contains list of all existing members
+        - When SOMEONE ELSE joins: body contains their hash (single-element list)
         """
         timestamp = datetime.now().strftime("%H:%M:%S")
 
@@ -1748,9 +1748,9 @@ class MainFrame(wx.Frame):
         if not isinstance(user_list, list):
             user_list = []
 
-        is_self_join = len(user_list) != 1
+        already_in_room = room in self.room_users
 
-        if is_self_join:
+        if not already_in_room:
             if self.room_list.FindString(room) == wx.NOT_FOUND:
                 self.room_list.Append(room)
 
@@ -1780,85 +1780,132 @@ class MainFrame(wx.Frame):
             elif self.active_room == room:
                 self._update_user_list()
         else:
-            user_hash = user_list[0]
-            if isinstance(user_hash, (bytes, bytearray)):
-                user_hex = user_hash.hex()
-                user_formatted = self._format_user(user_hash)
+            if len(user_list) > 0:
+                user_hash = user_list[0]
+                if isinstance(user_hash, (bytes, bytearray)):
+                    user_hex = user_hash.hex()
+                    user_formatted = self._format_user(user_hash)
 
-                if room not in self.room_users:
-                    self.room_users[room] = set()
-                self.room_users[room].add(user_hex)
+                    if room not in self.room_users:
+                        self.room_users[room] = set()
+                    self.room_users[room].add(user_hex)
 
-                self._append_styled_message(
-                    f"[{timestamp}] *** {user_formatted} joined {room} ***\n",
-                    color=self.COLOR_SYSTEM,
-                    italic=True,
-                    room=room,
-                )
+                    self._append_styled_message(
+                        f"[{timestamp}] *** {user_formatted} joined {room} ***\n",
+                        color=self.COLOR_SYSTEM,
+                        italic=True,
+                        room=room,
+                    )
 
-                if self.active_room == room:
-                    self._update_user_list()
+                    if self.active_room == room:
+                        self._update_user_list()
 
     def _on_parted(self, room: str, env: dict):
         """Handle PARTED confirmation.
 
-        This handles two scenarios:
-        1. Self-part: Multiple hashes or empty list (we left the room)
-        2. Member-part: Single hash (another user left a room we're in)
+        Per rrcd spec EX1:
+        All users (including the departing user) receive a PARTED message
+        containing only the departing user's identity hash (single-element list).
         """
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S")
 
-        body = env.get(K_BODY)
-        logger.debug(f"PARTED room={room}, body type={type(body)}, body={body}")
+            body = env.get(K_BODY)
+            logger.debug(f"PARTED room={room}, body type={type(body)}, body={body}")
+            logger.debug(f"Own identity hash: {self.own_identity_hash}")
 
-        user_list = None
-        if isinstance(body, dict):
-            user_list = body.get(B_JOINED_USERS)
-            logger.debug(f"Body is dict, user_list={user_list}")
-        elif isinstance(body, list):
-            user_list = body
-            logger.debug(f"Body is list directly, user_list={user_list}")
+            user_list = None
+            if isinstance(body, dict):
+                user_list = body.get(B_JOINED_USERS)
+                logger.debug(f"Body is dict, user_list={user_list}")
+            elif isinstance(body, list):
+                user_list = body
+                logger.debug(f"Body is list directly, user_list={user_list}")
 
-        if not isinstance(user_list, list):
-            user_list = []
+            if not isinstance(user_list, list):
+                user_list = []
+                logger.warning(f"PARTED body is not a list: {body}")
 
-        is_self_part = len(user_list) != 1
+            if len(user_list) == 1:
+                user_hash = user_list[0]
+                if isinstance(user_hash, (bytes, bytearray)):
+                    user_hex = user_hash.hex()
+                    logger.debug(f"Parting user hash: {user_hex}, is_us: {user_hex == self.own_identity_hash}")
+                    
+                    if user_hex == self.own_identity_hash:
+                        logger.info(f"We parted from room: {room} (new spec)")
+                        idx = self.room_list.FindString(room)
+                        logger.debug(f"Room list index for '{room}': {idx}")
+                        if idx != wx.NOT_FOUND:
+                            self.room_list.Delete(idx)
+                            logger.debug(f"Deleted room from list at index {idx}")
+                        else:
+                            logger.warning(f"Room '{room}' not found in room_list!")
 
-        if is_self_part:
-            idx = self.room_list.FindString(room)
-            if idx != wx.NOT_FOUND:
-                self.room_list.Delete(idx)
+                        self._append_styled_message(
+                            f"[{timestamp}] *** PARTED {room} ***\n",
+                            color=self.COLOR_SYSTEM,
+                            italic=True,
+                            room=room,
+                        )
 
-            self._append_styled_message(
-                f"[{timestamp}] *** PARTED {room} ***\n",
-                color=self.COLOR_SYSTEM,
-                italic=True,
-                room=room,
-            )
+                        if self.active_room == room:
+                            self._set_active_room(self.HUB_ROOM)
 
-            if self.active_room == room:
-                self._set_active_room(self.HUB_ROOM)
+                        if room in self.room_users:
+                            del self.room_users[room]
+                        
+                        if room in self.room_messages:
+                            del self.room_messages[room]
+                    else:
+                        logger.debug(f"User {user_hex[:16]}... parted from room: {room} (new spec)")
+                        user_formatted = self._format_user(user_hash)
 
-            if room in self.room_users:
-                del self.room_users[room]
-        else:
-            user_hash = user_list[0]
-            if isinstance(user_hash, (bytes, bytearray)):
-                user_hex = user_hash.hex()
-                user_formatted = self._format_user(user_hash)
+                        if room in self.room_users:
+                            self.room_users[room].discard(user_hex)
 
-                if room in self.room_users:
-                    self.room_users[room].discard(user_hex)
+                        self._append_styled_message(
+                            f"[{timestamp}] *** {user_formatted} left {room} ***\n",
+                            color=self.COLOR_SYSTEM,
+                            italic=True,
+                            room=room,
+                        )
 
-                self._append_styled_message(
-                    f"[{timestamp}] *** {user_formatted} left {room} ***\n",
-                    color=self.COLOR_SYSTEM,
-                    italic=True,
-                    room=room,
-                )
+                        if self.active_room == room:
+                            self._update_user_list()
+            else:
+                user_hashes_in_body = set()
+                for user_hash in user_list:
+                    if isinstance(user_hash, (bytes, bytearray)):
+                        user_hashes_in_body.add(user_hash.hex())
+                
+                we_are_in_body = self.own_identity_hash in user_hashes_in_body
+                
+                if not we_are_in_body:
+                    logger.info(f"We parted from room: {room} (old spec, {len(user_list)} remaining)")
+                    idx = self.room_list.FindString(room)
+                    if idx != wx.NOT_FOUND:
+                        self.room_list.Delete(idx)
 
-                if self.active_room == room:
-                    self._update_user_list()
+                    self._append_styled_message(
+                        f"[{timestamp}] *** PARTED {room} ***\n",
+                        color=self.COLOR_SYSTEM,
+                        italic=True,
+                        room=room,
+                    )
+
+                    if self.active_room == room:
+                        self._set_active_room(self.HUB_ROOM)
+
+                    if room in self.room_users:
+                        del self.room_users[room]
+                    
+                    if room in self.room_messages:
+                        del self.room_messages[room]
+                else:
+                    logger.warning(f"PARTED with multiple users ({len(user_list)}) but we're in the list - unexpected")
+        except Exception as e:
+            logger.exception(f"Exception in _on_parted handler for room {room}: {e}")
 
     def _on_close(self):
         """Handle connection close (called from callback thread)."""

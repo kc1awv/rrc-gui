@@ -273,8 +273,24 @@ class Client:
             )
             t.start()
 
-        def _closed(_: RNS.Link) -> None:
+        def _closed(link: RNS.Link) -> None:
+            link_status = "unknown"
+            try:
+                if hasattr(link, 'status'):
+                    link_status = link.status
+                elif hasattr(link, '_Link__status'):
+                    link_status = link._Link__status
+            except Exception:
+                pass
+                
+            logger.info(f"Link closed callback triggered, link_status={link_status}, link_id={link.link_id.hex() if hasattr(link, 'link_id') and link.link_id else 'unknown'}")
+            
             with self._lock:
+                # Only clear state if this is still our active link
+                if self.link is not link:
+                    logger.info("Closed callback for non-current link, ignoring")
+                    return
+                    
                 self.link = None
                 self.rooms.clear()
                 active_resources = list(self._active_resources)
@@ -302,6 +318,7 @@ class Client:
 
             if self.on_close:
                 try:
+                    logger.info("Calling on_close callback due to link closure")
                     self.on_close()
                 except Exception as e:
                     logger.exception("Error in on_close callback: %s", e)

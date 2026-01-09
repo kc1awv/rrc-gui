@@ -453,15 +453,20 @@ class RestartDialog(wx.Dialog):
 
     def __init__(self, parent):
         super().__init__(
-            parent, title="Restart Required", size=(450, 200), style=wx.DEFAULT_DIALOG_STYLE
+            parent,
+            title="Restart Required",
+            size=(450, 200),
+            style=wx.DEFAULT_DIALOG_STYLE,
         )
 
         panel = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
 
         hbox_msg = wx.BoxSizer(wx.HORIZONTAL)
-        
-        icon = wx.ArtProvider.GetBitmap(wx.ART_INFORMATION, wx.ART_MESSAGE_BOX, (48, 48))
+
+        icon = wx.ArtProvider.GetBitmap(
+            wx.ART_INFORMATION, wx.ART_MESSAGE_BOX, (48, 48)
+        )
         icon_bitmap = wx.StaticBitmap(panel, bitmap=icon)
         hbox_msg.Add(icon_bitmap, flag=wx.ALL, border=10)
 
@@ -485,7 +490,7 @@ class RestartDialog(wx.Dialog):
         button_box = wx.BoxSizer(wx.HORIZONTAL)
         restart_btn = wx.Button(panel, wx.ID_YES, "Restart Now")
         later_btn = wx.Button(panel, wx.ID_NO, "Restart Later")
-        
+
         restart_btn.SetDefault()
         button_box.Add(restart_btn)
         button_box.Add(later_btn, flag=wx.LEFT, border=5)
